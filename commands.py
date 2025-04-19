@@ -1,102 +1,102 @@
-import asyncio
+from discord import app_commands, Embed, Interaction, Color
+from discord.ext import tasks
 from datetime import datetime, timedelta
-import discord
-from discord.ext import commands
+from discord.ext.commands import Bot
 from steam_web_api import Steam
 import time
 
-steam = None
+reminder_tasks = {}
 
-async def setup(bot, steam_client: Steam):
-    """Function to add all commands to the bot"""
-    global steam
-    steam = steam_client
-    bot.add_command(ping)
-    bot.add_command(hello)
-    bot.add_command(countdown)
-    bot.add_command(game_embed)
-
-
-@commands.command(name='game')
-async def game_embed(ctx, max_players: int, minutes_delay: int=0, *game_name):
-    if not game_name:
-        await ctx.send(f"Specify game name")
-        return
-
-    game_name = ' '.join(game_name)
+@app_commands.command(name="game", description="Показать информацию об игре из Steam")
+@app_commands.describe(
+    max_players="Сколько игроков будет участвовать?",
+    minutes_delay="Через сколько минут игра начнется?",
+    game_name="Название игры (на английском, будет поиск в Steam)"
+)
+async def game_embed(interaction: Interaction, max_players: int, minutes_delay: int, game_name: str):
     search_results = steam.apps.search_games(game_name)
-    if (not search_results.get('apps', '')) and (len(search_results['apps']) == 0):
-        await ctx.send(f"No results found for '{game_name}'.")
+    if not search_results.get('apps') or len(search_results['apps']) == 0:
+        await interaction.response.send_message(f"Не найдено результатов для '{game_name}'.", ephemeral=True)
         return
-    
-    search_results = search_results['apps']
-    game = search_results[0]
+
+    game = search_results['apps'][0]
     game_id = game['id'][0]
     game_link = game['link']
-    
 
     game_instance = steam.apps.get_app_details(game_id, country="RU", filters="basic,price_overview")
     if game_instance is None:
-        await ctx.send(f"No results found for game with id '{game_id}'.")
+        await interaction.response.send_message(f"Не удалось получить данные об игре с ID '{game_id}'.", ephemeral=True)
         return
-    
-    
-    game_instance = game_instance[str(game_id)]['data']
-    image_link = game_instance['header_image']
-    price = 'Бесплатно' if game_instance['is_free'] else game_instance['price_overview']['final_formatted']
-    description = game_instance['short_description']
+
+    game_data = game_instance[str(game_id)]['data']
+    image_link = game_data['header_image']
+    price = 'Бесплатно' if game_data['is_free'] else game_data['price_overview']['final_formatted']
+    description = game_data['short_description']
 
     future_time = datetime.now() + timedelta(minutes=minutes_delay)
     unix_timestamp = int(time.mktime(future_time.timetuple()))
 
-    embed = discord.Embed(
+    embed = Embed(
         title=game_name,
         description=description,
-        color=discord.Color.blue(),
+        color=Color.blue(),
         url=game_link
     )
-    
-    # Add author information
-    embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.avatar.url)
-    
-    # Add inline fields for max players and online play status
+    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar.url)
     embed.add_field(name="Сколько игроков?", value=max_players, inline=True)
     embed.add_field(name="Цена?", value=price, inline=True)
     embed.add_field(name="Когда?", value=f'<t:{unix_timestamp}:R>', inline=True)
-    
-    # Add game image
     embed.set_image(url=image_link)
-    
-    # Add footer with timestamp
-    embed.set_footer(text=f"Call by {ctx.author.name}", icon_url=ctx.author.avatar.url)
+    embed.set_footer(text=f"Call by {interaction.user.name}", icon_url=interaction.user.avatar.url)
     embed.timestamp = datetime.now()
-    
-    # Send the embed
-    await ctx.send(embed=embed)
 
-@commands.command(name='ping')
-async def ping(ctx):
-    """Responds with the bot's latency."""
-    latency = round(ctx.bot.latency * 1000)
-    await ctx.send(f'Pong! Latency: {latency}ms')
+    await interaction.response.send_message(embed=embed)
+    msg = await interaction.original_response()
+    await msg.add_reaction("💝")  # добавляем реакцию
 
-@commands.command(name='hello')
-async def hello(ctx):
-    """Greets the user who called the command."""
-    await ctx.send(f'Hello, {ctx.author.mention}!')
+    reminder_tasks[msg.id] = {
+        "users": set(),  # сюда будем добавлять пользователей
+        "time": future_time
+    }
 
-@commands.command(name='countdown')
-async def countdown(ctx, seconds: int = 5):
-    """Starts a countdown from the specified number of seconds."""
-    if seconds > 60:
-        await ctx.send("Please use a value of 60 seconds or less.")
-        return
-        
-    message = await ctx.send(f"Countdown: {seconds}")
-    
-    while seconds > 0:
-        seconds -= 1
-        await asyncio.sleep(1)
-        await message.edit(content=f"Countdown: {seconds}")
-    
-    await message.edit(content="Countdown complete!")
+    if not reminder_loop.is_running():
+        reminder_loop.start()
+
+# Функция setup, как и раньше, просто добавляет команду
+async def setup(bot: Bot, _steam: Steam):
+    global steam
+    steam = _steam
+    bot.tree.add_command(game_embed)
+
+    @bot.event
+    async def on_reaction_add(reaction, user):
+        """Обработка нажатий на реакцию."""
+        if user.bot:
+            return
+        if reaction.message.id in reminder_tasks:
+            reminder_tasks[reaction.message.id]["users"].add(user)
+
+    @bot.event
+    async def on_reaction_remove(reaction, user):
+        """Если пользователь убрал реакцию — удалим из списка."""
+        if user.bot:
+            return
+        if reaction.message.id in reminder_tasks:
+            reminder_tasks[reaction.message.id]["users"].discard(user)
+
+@tasks.loop(seconds=30)
+async def reminder_loop():
+    now = datetime.now()
+    expired = []
+    for message_id, data in reminder_tasks.items():
+        if now >= data["time"]:
+            for user in data["users"]:
+                try:
+                    await user.send("🔔 Время играть! Ждём тебя 😉")
+                except Exception as e:
+                    print(f"Не удалось отправить сообщение {user}: {e}")
+            expired.append(message_id)
+
+    # Удалим выполненные задачи
+    for message_id in expired:
+        reminder_tasks.pop(message_id, None)

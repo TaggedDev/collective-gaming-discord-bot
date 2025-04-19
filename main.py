@@ -1,5 +1,6 @@
 import os
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 from steam_web_api import Steam
@@ -28,6 +29,7 @@ async def on_ready():
     
     # Load commands from the commands.py file
     await bot_commands.setup(bot, steam)
+    await bot.tree.sync()
     print('Commands loaded')
     print('------')
 
