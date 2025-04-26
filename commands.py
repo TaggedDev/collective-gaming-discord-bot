@@ -1,27 +1,34 @@
-from discord import app_commands, Embed, Interaction, Color
+from discord import app_commands, Embed, Interaction, Color, Message, Reaction, User
 from discord.ext import tasks
-from datetime import datetime, timedelta
 from discord.ext.commands import Bot
+from datetime import datetime, timedelta
 from steam_web_api import Steam
+from typing import Dict, Set, Any
 import time
 
-reminder_tasks = {}
+reminder_tasks: Dict[int, Dict[str, Any]] = {}
 
 @app_commands.command(name="game", description="Показать информацию об игре из Steam")
 @app_commands.describe(
     max_players="Сколько игроков будет участвовать?",
     minutes_delay="Через сколько минут игра начнется?",
-    game_name="Название игры (на английском, будет поиск в Steam)"
+    game_input_name="Название игры (на английском, будет поиск в Steam)"
 )
-async def game_embed(interaction: Interaction, max_players: int, minutes_delay: int, game_name: str):
-    search_results = steam.apps.search_games(game_name)
-    if not search_results.get('apps') or len(search_results['apps']) == 0:
-        await interaction.response.send_message(f"Не найдено результатов для '{game_name}'.", ephemeral=True)
+async def game_embed(
+    interaction: Interaction,
+    max_players: int,
+    minutes_delay: int,
+    game_input_name: str
+) -> None:
+    search_results = steam.apps.search_games(game_input_name)
+    if not search_results.get('apps'):
+        await interaction.response.send_message(f"Не найдено результатов для '{game_input_name}'.", ephemeral=True)
         return
 
     game = search_results['apps'][0]
     game_id = game['id'][0]
     game_link = game['link']
+    game_name = game['name']
 
     game_instance = steam.apps.get_app_details(game_id, country="RU", filters="basic,price_overview")
     if game_instance is None:
@@ -36,6 +43,35 @@ async def game_embed(interaction: Interaction, max_players: int, minutes_delay: 
     future_time = datetime.now() + timedelta(minutes=minutes_delay)
     unix_timestamp = int(time.mktime(future_time.timetuple()))
 
+    embed = generate_embed(
+        interaction,
+        max_players, 
+        game_name, 
+        game_link, 
+        image_link, 
+        price, 
+        description, 
+        unix_timestamp
+    )
+
+    await interaction.response.send_message(embed=embed)
+    msg = await interaction.original_response()
+    await msg.add_reaction("💝")
+
+    reminder_tasks[msg.id] = {
+        "users": set(),
+        "time": future_time,
+        "message": msg,
+        "max_players": max_players,
+        "game_name": game_name,
+        "game_link": game_link,
+        "channel_id": interaction.channel_id,
+    }
+
+    if not reminder_loop.is_running():
+        reminder_loop.start()
+
+def generate_embed(interaction, max_players, game_name, game_link, image_link, price, description, unix_timestamp):
     embed = Embed(
         title=game_name,
         description=description,
@@ -46,57 +82,88 @@ async def game_embed(interaction: Interaction, max_players: int, minutes_delay: 
     embed.add_field(name="Сколько игроков?", value=max_players, inline=True)
     embed.add_field(name="Цена?", value=price, inline=True)
     embed.add_field(name="Когда?", value=f'<t:{unix_timestamp}:R>', inline=True)
+    embed.add_field(name="Игроки", value="Пока никто не присоединился", inline=False)
     embed.set_image(url=image_link)
     embed.set_footer(text=f"Call by {interaction.user.name}", icon_url=interaction.user.avatar.url)
     embed.timestamp = datetime.now()
+    return embed
 
-    await interaction.response.send_message(embed=embed)
-    msg = await interaction.original_response()
-    await msg.add_reaction("💝")  # добавляем реакцию
-
-    reminder_tasks[msg.id] = {
-        "users": set(),  # сюда будем добавлять пользователей
-        "time": future_time
-    }
-
-    if not reminder_loop.is_running():
-        reminder_loop.start()
-
-# Функция setup, как и раньше, просто добавляет команду
-async def setup(bot: Bot, _steam: Steam):
+async def setup(bot: Bot, _steam: Steam) -> None:
     global steam
     steam = _steam
     bot.tree.add_command(game_embed)
 
     @bot.event
-    async def on_reaction_add(reaction, user):
-        """Обработка нажатий на реакцию."""
-        if user.bot:
+    async def on_reaction_add(reaction: Reaction, user: User) -> None:
+        if user.bot or str(reaction.emoji) != "💝":
             return
-        if reaction.message.id in reminder_tasks:
-            reminder_tasks[reaction.message.id]["users"].add(user)
+
+        message_id = reaction.message.id
+        if message_id not in reminder_tasks:
+            return
+
+        task = reminder_tasks[message_id]
+        task["users"].add(user)
+
+        embed = reaction.message.embeds[0]
+        player_count = len(task["users"])
+        for i, field in enumerate(embed.fields):
+            if field.name == "Игроки":
+                player_list = "\n".join([f"{idx + 1}. {u.mention}" for idx, u in enumerate(task["users"])])
+                embed.set_field_at(
+                    i,
+                    name="Игроки",
+                    value=player_list if player_count else "Пока никто не присоединился",
+                    inline=False
+                )
+
+        await reaction.message.edit(embed=embed)
 
     @bot.event
-    async def on_reaction_remove(reaction, user):
-        """Если пользователь убрал реакцию — удалим из списка."""
-        if user.bot:
+    async def on_reaction_remove(reaction: Reaction, user: User) -> None:
+        if user.bot or str(reaction.emoji) != "💝":
             return
-        if reaction.message.id in reminder_tasks:
-            reminder_tasks[reaction.message.id]["users"].discard(user)
+
+        message_id = reaction.message.id
+        if message_id not in reminder_tasks:
+            return
+
+        task = reminder_tasks[message_id]
+        task["users"].discard(user)
+
+        embed = reaction.message.embeds[0]
+        player_count = len(task["users"])
+        for i, field in enumerate(embed.fields):
+            if field.name == "Игроки":
+                player_list = "\n".join([f"{idx + 1}. {u.mention}" for idx, u in enumerate(task["users"])])
+                embed.set_field_at(
+                    i,
+                    name="Игроки",
+                    value=player_list if player_count else "Пока никто не присоединился",
+                    inline=False
+                )
+
+        await reaction.message.edit(embed=embed)
 
 @tasks.loop(seconds=30)
-async def reminder_loop():
+async def reminder_loop() -> None:
     now = datetime.now()
-    expired = []
+    expired: list[int] = []
+
     for message_id, data in reminder_tasks.items():
         if now >= data["time"]:
+            channel_mention = f"<#{data['channel_id']}>"
             for user in data["users"]:
                 try:
-                    await user.send("🔔 Время играть! Ждём тебя 😉")
+                    if data.get('game_link'):
+                        game_inline = f"[{data['game_name']}]({data['game_link']})"
+                    else:
+                        game_inline = f"{data['game_name']}"
+
+                    await user.send(f"🔔 Планируем играть в {game_inline}, заходи в {channel_mention}")
                 except Exception as e:
                     print(f"Не удалось отправить сообщение {user}: {e}")
             expired.append(message_id)
 
-    # Удалим выполненные задачи
     for message_id in expired:
         reminder_tasks.pop(message_id, None)
